@@ -57,13 +57,19 @@ def _apps():
 
 
 def find_group_coord(group_name):
-    """会话列表里找群会话，返回中心坐标 (x,y)。"""
+    """会话列表里找群会话，返回中心坐标 (x,y)。
+
+    只认左侧会话列表(e.x<280)且 name 以目标名开头的行。
+    历史教训(2026-07-09 误发事故)：不限区域的全名子串匹配会命中
+    聊天区里的消息行(如「Quote 灰灰's message」引用行)，点击后会话
+    不切换，后续读历史/回复全部落在错误会话。"""
     def f(n):
         try:
-            if (n.getRoleName() == "list item" and group_name in (n.name or "")
+            if (n.getRoleName() == "list item"
+                    and (n.name or "").startswith(group_name)
                     and n.getState().contains(pyatspi.STATE_SHOWING)):
                 e = n.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
-                if e.width > 0:
+                if e.width > 0 and e.x < 280:
                     return (e.x + e.width // 2, e.y + e.height // 2)
             for c in n:
                 if c:
@@ -243,6 +249,36 @@ def _chat_loaded():
     return False
 
 
+def find_input_box():
+    """当前打开会话的输入框：返回 (聊天标题, (x,y,w,h))；未找到返回 (None, None)。
+
+    输入框是聊天区(e.x>280)内 EDITABLE 的 text 节点，其 name 即当前聊天标题
+    (实测无成员数等后缀)；x>280 同时排除左上角 Search 框。"""
+    for a in _apps():
+        stack = [a]
+        while stack:
+            n = stack.pop()
+            try:
+                st = n.getState()
+                if (n.getRoleName() == "text"
+                        and st.contains(pyatspi.STATE_EDITABLE)
+                        and st.contains(pyatspi.STATE_SHOWING)):
+                    e = n.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    if e.x > 280 and e.width > 0:
+                        return (n.name or "").strip(), (e.x, e.y, e.width, e.height)
+                for c in n:
+                    if c:
+                        stack.append(c)
+            except Exception:
+                pass
+    return None, None
+
+
+def current_chat_title():
+    """当前打开会话的标题(输入框 name)；无打开会话/未找到返回 None。"""
+    return find_input_box()[0]
+
+
 def _open_chat(pos):
     """点击会话并确认聊天区加载；落空则重试点击。返回是否成功。"""
     for _ in range(3):
@@ -267,6 +303,10 @@ def resolve_media(group_name, text):
             _scroll_list("up", scrolled * 4 + 4)   # 滚回会话列表顶部
         return text, []
     if not _open_chat(pos):                          # 点击落空(聊天区空白)则重试
+        if scrolled:
+            _scroll_list("up", scrolled * 4 + 4)
+        return text, []
+    if current_chat_title() != group_name:           # 开窗校验：必须就是目标群
         if scrolled:
             _scroll_list("up", scrolled * 4 + 4)
         return text, []

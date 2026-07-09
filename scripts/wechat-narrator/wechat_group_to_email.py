@@ -224,6 +224,10 @@ def main():
                     if sender == "self":
                         log("  最新是我自己发的(绿气泡/右头像)，跳过，不回复不转发")
                         continue
+                    if sender == "wrong_chat":
+                        log(f"  ⚠ 会话校验失败(当前窗口≠{who})，已中止回复，仅转发预览")
+                        send_mail(cfg, who, latest or text, kind)
+                        continue
                     body = latest or text
                     if reply:
                         reply_state[who] = reply

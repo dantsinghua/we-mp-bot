@@ -224,14 +224,27 @@ def generate_reply(history):
     return _openclaw([{"role": "system", "content": PERSONA}, user_msg], CHAT_MODEL, 220)
 
 
-def send_reply(text):
-    """把回复粘贴到输入框并发送(会话须已打开)。中文用剪贴板+Ctrl+V。"""
+def send_reply(text, peer=PEER):
+    """把回复粘贴到输入框并发送(会话须已打开)。中文用剪贴板+Ctrl+V。
+
+    最后闸门(2026-07-09 误发进群事故)：点击输入框前、回车发送前两次校验
+    「输入框 name(=当前聊天标题) == peer」，任一不匹配立即中止返回 False——
+    宁可不发，绝不发错会话。输入框坐标实取节点 extents，不再盲点固定坐标。"""
+    from wechat_media_resolve import find_input_box
+    title, box = find_input_box()
+    if title != peer or not box:
+        return False
+    x, y, w, h = box
     # 直接管道写剪贴板，避免 shell 对中文/特殊字符转义
     subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"))
     time.sleep(0.3)
-    subprocess.run(["xdotool", "mousemove", "700", "600", "click", "1"]); time.sleep(0.3)
+    subprocess.run(["xdotool", "mousemove", str(x + w // 2), str(y + h // 2),
+                    "click", "1"]); time.sleep(0.3)
     subprocess.run(["xdotool", "key", "ctrl+v"]); time.sleep(0.5)
+    if find_input_box()[0] != peer:      # 粘贴后、回车前终检
+        return False
     subprocess.run(["xdotool", "key", "Return"]); time.sleep(0.6)
+    return True
 
 
 def do_auto_reply(peer=PEER):
@@ -239,12 +252,14 @@ def do_auto_reply(peer=PEER):
 
     返回 (回复文本, 最新消息文本, sender)：
       - sender=='self'：最新一条是我自己发的(绿气泡/右头像)，不回复，reply=None；
-      - sender=='peer'：对方刚发来，已生成并发送回复(LLM 失败则 reply=None)；
+      - sender=='peer'：对方刚发来，已生成并发送回复(LLM/发送失败则 reply=None)；
+      - sender=='wrong_chat'：打开的会话经校验不是 peer(或发送前校验失败)，
+        已中止，绝不读错聊天/发错会话；
       - 打不开/读空：返回 (None, None, None)。
     供 group2email 在检测到私聊预览变化时调用。会临时打开会话(影响轮询约数秒)。
     """
     from wechat_media_resolve import (find_group_coord, find_group_scroll,
-                                      _open_chat, _scroll_list)
+                                      _open_chat, _scroll_list, current_chat_title)
     _scroll_list("up", 12); time.sleep(0.5)
     pos = find_group_coord(peer)
     if not pos:
@@ -252,6 +267,8 @@ def do_auto_reply(peer=PEER):
     if not pos:
         return None, None, None
     _open_chat(pos); time.sleep(1.5)
+    if current_chat_title() != peer:     # 开窗校验：打开的必须就是 peer 的会话
+        return None, None, "wrong_chat"
     hist = []
     for _ in range(3):                 # AT-SPI 时序：读空则重试
         hist = read_history()
@@ -265,8 +282,8 @@ def do_auto_reply(peer=PEER):
         # 最新一条是我自己发的 → 不回复(避免回复自己、避免自问自答死循环)
         return None, latest_text, "self"
     reply = generate_reply(hist)
-    if reply:
-        send_reply(reply)
+    if reply and not send_reply(reply, peer):
+        return None, latest_text, "wrong_chat"   # 发送前校验失败，未发出
     return reply, latest_text, "peer"
 
 
