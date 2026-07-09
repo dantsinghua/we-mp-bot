@@ -1,0 +1,18 @@
+# --- secrets & runtime data: never commit ---
+scripts/wechat-narrator/wemprss-data/
+__pycache__/
+*.pyc
+logs/
+data/
+frps.toml
+wstunnel
+wstunnel_linux_arm64
+
+# workspace state / tool dirs (contain configs, backups, possibly credentials)
+.claude/
+.clawdhub/
+.omc/
+.openclaw/
+config/
+memory/
+openclaw-workspace-state.json
