@@ -396,6 +396,7 @@ def main():
 
     log(f"we-mp-rss 图文桥接启动(API+AK, {LLM_MODEL}清洗, 图片内嵌)：→ {args.to_addr}"
         f"（每 {args.interval:.0f}s 检查）")
+    last_hb = 0.0
     while True:
         try:
             seen = load_seen()
@@ -413,6 +414,9 @@ def main():
                     log(f"发送失败 {aid}: {e}")
         except Exception as e:
             log(f"循环异常: {e}")
+        if time.time() - last_hb >= 3600:    # 每小时一条心跳,供看门狗判活(空闲时也有日志)
+            last_hb = time.time()
+            log("心跳")
         time.sleep(args.interval)
 
 

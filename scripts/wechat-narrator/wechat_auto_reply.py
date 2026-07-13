@@ -142,7 +142,7 @@ def _openclaw(messages, model, max_tokens=300):
         return json.loads(r.read())["choices"][0]["message"]["content"].strip()
 
 
-def read_history(n=15):
+def read_history(n=30):
     """AT-SPI 读最近 n 条消息(准确文字)，区分文本/图片，并按气泡颜色/头像判定发送方。
 
     返回 [{"kind":"text"|"image", "text":内容, "sender":"self"|"peer"}]，
@@ -186,6 +186,35 @@ def _latest_text(history):
     """取最新一条的展示用文本(日志/邮件用)。图片只标占位，不做描述转换。"""
     latest = history[-1]
     return "[老婆发来一张图片]" if latest["kind"] == "image" else latest["text"]
+
+
+CURSOR_K = 3     # 游标锚块长度:用"最后K条(文本,发送方)序列"定位,抗重复文本
+
+
+def make_cursor(history):
+    """从历史生成游标锚块(最后 K 条)。"""
+    return [(h["text"], h.get("sender")) for h in history[-CURSOR_K:]]
+
+
+def diff_since_cursor(history, cursor):
+    """返回 (游标之后的新消息列表, truncated)。
+
+    锚块匹配:在 history 里找 cursor 序列的最后一次完整出现,其后即新消息。
+    cursor=None(冷启动) → 只算最新一条(保守,同旧行为)。
+    锚块找不到(忙碌窗口内爆发超出可见范围) → 全部可见消息视为新,truncated=True
+    (邮件侧应标注"可能有更早消息未捕获/或含重复")。宁可标注,绝不静默丢。
+    """
+    if not history:
+        return [], False
+    if not cursor:
+        return history[-1:], False
+    seq = [(h["text"], h.get("sender")) for h in history]
+    k = len(cursor)
+    for i in range(len(seq) - k, -1, -1):          # 从后往前找最后一次出现
+        if seq[i:i + k] == cursor:
+            return history[i + k:], False
+    # 锚块不在可见窗口:可能大洪峰把它顶出去了
+    return list(history), True
 
 
 def generate_reply(history):
@@ -247,28 +276,34 @@ def send_reply(text, peer=PEER):
     return True
 
 
-def do_auto_reply(peer=PEER):
-    """打开对方会话→读历史→(判定发送方)→生成→发送。
+def do_auto_reply(peer=PEER, cursor=None):
+    """打开对方会话→读历史→游标补收→(最新是对方发的才)生成并发送回复。
 
-    返回 (回复文本, 最新消息文本, sender)：
-      - sender=='self'：最新一条是我自己发的(绿气泡/右头像)，不回复，reply=None；
-      - sender=='peer'：对方刚发来，已生成并发送回复(LLM/发送失败则 reply=None)；
-      - sender=='wrong_chat'：打开的会话经校验不是 peer(或发送前校验失败)，
-        已中止，绝不读错聊天/发错会话；
-      - 打不开/读空：返回 (None, None, None)。
-    供 group2email 在检测到私聊预览变化时调用。会临时打开会话(影响轮询约数秒)。
+    返回 dict:
+      sender   : 'peer'|'self'|'wrong_chat'|None(打不开/读空)
+      reply    : 已发送的回复文本(未回复/发送被闸门拦截为 None)
+      latest   : 最新一条展示文本
+      new_msgs : 游标之后的新消息 [{kind,text,sender}](含双方,调用方按需筛选转发)
+      cursor   : 新游标锚块;wrong_chat/失败时为 None(游标不前进,下轮重收)
+      truncated: 锚块超出可见窗口(洪峰>可见行数,邮件应标注可能不全/含重复)
+
+    "最新是 self"不再整体跳过——new_msgs 仍带回漏收的对方消息(修 7/12 丢照片问题)。
+    回复保鲜:LLM 生成期间对方又发新消息 → 用新历史重新生成一次(仅一次)。
     """
     from wechat_media_resolve import (find_group_coord, find_group_scroll,
                                       _open_chat, _scroll_list, current_chat_title)
+    out = {"reply": None, "latest": None, "sender": None,
+           "new_msgs": [], "cursor": None, "truncated": False}
     _scroll_list("up", 12); time.sleep(0.5)
     pos = find_group_coord(peer)
     if not pos:
         pos, _ = find_group_scroll(peer)
     if not pos:
-        return None, None, None
+        return out
     _open_chat(pos); time.sleep(1.5)
     if current_chat_title() != peer:     # 开窗校验：打开的必须就是 peer 的会话
-        return None, None, "wrong_chat"
+        out["sender"] = "wrong_chat"
+        return out
     hist = []
     for _ in range(3):                 # AT-SPI 时序：读空则重试
         hist = read_history()
@@ -276,15 +311,26 @@ def do_auto_reply(peer=PEER):
             break
         time.sleep(1)
     if not hist:
-        return None, None, None
-    latest_text = _latest_text(hist)
-    if hist[-1].get("sender") == "self":
-        # 最新一条是我自己发的 → 不回复(避免回复自己、避免自问自答死循环)
-        return None, latest_text, "self"
-    reply = generate_reply(hist)
-    if reply and not send_reply(reply, peer):
-        return None, latest_text, "wrong_chat"   # 发送前校验失败，未发出
-    return reply, latest_text, "peer"
+        return out
+    out["new_msgs"], out["truncated"] = diff_since_cursor(hist, cursor)
+    out["latest"] = _latest_text(hist)
+    out["sender"] = hist[-1].get("sender")
+    if out["sender"] == "peer":
+        reply = generate_reply(hist)
+        fresh = read_history()           # 保鲜:期间又来新消息则重生成一次
+        if (reply and fresh and fresh[-1].get("sender") == "peer"
+                and fresh[-1]["text"] != hist[-1]["text"]):
+            hist = fresh
+            out["new_msgs"], t2 = diff_since_cursor(hist, cursor)
+            out["truncated"] = out["truncated"] or t2
+            out["latest"] = _latest_text(hist)
+            reply = generate_reply(hist)
+        if reply and not send_reply(reply, peer):
+            out["sender"] = "wrong_chat"   # 发送闸门拦截:未发出,游标不前进
+            return out
+        out["reply"] = reply
+    out["cursor"] = make_cursor(hist)
+    return out
 
 
 if __name__ == "__main__":

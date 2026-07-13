@@ -121,16 +121,16 @@ def capture_image(group_name):
     return png if os.path.exists(png) else None
 
 
-def describe_image(png):
-    """把图片文件交给 OpenClaw 多模态描述；失败返回 None。"""
-    try:
-        with open(png, "rb") as fp:
-            img = base64.b64encode(fp.read()).decode()
-    except Exception:
-        return None
+# 多模态"看不到图"类拒答特征(模型侧偶发故障/failover到非多模态模型时出现,
+# 2026-07-13 观测)。命中则视为无效描述,重试一次,仍失败由调用方回退占位。
+REFUSAL_RE = re.compile(
+    r"无法(访问|查看|识别|打开)|没有(收到|看到|接收)|未(收到|提供)|看不到|无法获取|重新发送")
+
+
+def _describe_once(img_b64):
     body = {"model": "openclaw/default", "messages": [{"role": "user", "content": [
         {"type": "text", "text": "这是微信群里的一张图片，用一句话简短描述内容"},
-        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]}]}
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + img_b64}}]}]}
     req = urllib.request.Request(
         OPENCLAW_URL, data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
@@ -141,6 +141,27 @@ def describe_image(png):
             return json.loads(r.read())["choices"][0]["message"]["content"].strip()
     except Exception:
         return None
+
+
+def describe_image(png):
+    """把图片文件交给 OpenClaw 多模态描述。
+
+    返回有效描述文本；模型拒答(看不到图)时重试一次；两次都拒答/失败返回 None。
+    调用方(resolve_media)拿到 None 会回退成「[图片(见附件)]」，不把废话写进邮件。
+    """
+    try:
+        with open(png, "rb") as fp:
+            img = base64.b64encode(fp.read()).decode()
+    except Exception:
+        return None
+    for _ in range(2):
+        desc = _describe_once(img)
+        if desc and not REFUSAL_RE.search(desc):
+            return desc
+        if desc is None:
+            break                       # 网络/接口错误,重试同样会失败,不空转
+        time.sleep(1)                   # 拒答:等 1 秒再试一次(避开瞬时 failover)
+    return None
 
 
 # 语音 list item 前缀，转写文字拼在其后：'Audio11"sec我们怎么调…'
@@ -246,6 +267,83 @@ def _chat_loaded():
                         stack.append(c)
             except Exception:
                 pass
+    return False
+
+
+DM_PINNED = os.environ.get("WN_DM_PINNED", "灰灰")   # 置顶私聊,规范态锚点(须保持置顶)
+_canon = {"fails": 0, "last_alert": 0.0}
+
+
+def _list_rows():
+    """左侧会话列表当前可见的行 [(y, name)]。"""
+    rows = []
+    for a in _apps():
+        stack = [a]
+        while stack:
+            n = stack.pop()
+            try:
+                nm = (n.name or "")
+                if (n.getRoleName() == "list item" and nm
+                        and n.getState().contains(pyatspi.STATE_SHOWING)):
+                    e = n.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                    if e.x < 280 and e.width > 100:
+                        rows.append((e.y, nm))
+                for c in n:
+                    if c:
+                        stack.append(c)
+            except Exception:
+                pass
+    return rows
+
+
+def _forensic_shot(tag):
+    """告警取证截图,返回文件路径(失败返回 None)。"""
+    d = os.path.join(os.path.expanduser("~"), ".wechat-narrator", "logs")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, f"forensic_{tag}_{int(time.time())}.png")
+    try:
+        subprocess.run(["import", "-window", "root", p],
+                       env={**os.environ, "DISPLAY": DISPLAY},
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        return p if os.path.exists(p) else None
+    except Exception:
+        return None
+
+
+def ensure_canonical(alert_cb=None):
+    """规范态自愈:会话列表须在顶部、置顶私聊行(DM_PINNED)可见。
+
+    背景(2026-07-11/13 两次私聊失明):微信打开列表下方会话时会自动滚动列表,
+    置顶区被顶出视口后轮询对私聊行全盲。本函数每轮轮询前调用:
+      可见 → 直接返回 True(一次 AT-SPI 读,零扰动);
+      不可见 → 滚顶自愈再查;连续 2 次自愈失败 → 截图 + alert_cb 告警(限频 1 次/小时)。
+    行数为 0 视作可能掉线(登录哨兵),同样走告警路径。
+    alert_cb(subject, body, attachment_path_or_None)
+    """
+    rows = _list_rows()
+    if any(nm.startswith(DM_PINNED) for _, nm in rows):
+        _canon["fails"] = 0
+        return True
+    # 滚到绝对顶部:漂移深度不定(打开靠下的群会滚很远),固定次数可能回不到顶;
+    # 列表到顶后多余滚动是无副作用空操作,故用足量次数保证到顶。
+    _scroll_list("up", 30)
+    time.sleep(0.8)
+    rows = _list_rows()
+    if any(nm.startswith(DM_PINNED) for _, nm in rows):
+        _canon["fails"] = 0
+        return True
+    _canon["fails"] += 1
+    if _canon["fails"] >= 2 and alert_cb and time.time() - _canon["last_alert"] > 3600:
+        _canon["last_alert"] = time.time()
+        shot = _forensic_shot("canon")
+        if not rows:
+            alert_cb("微信可能已掉线(会话列表为空)",
+                     "连续 2 轮读不到任何会话行——大概率被登出或有弹窗遮挡。\n"
+                     "请查看取证截图;需要扫码对 Claude 说「出二维码」。", shot)
+        else:
+            alert_cb(f"规范态自愈失败({DM_PINNED} 行不可见)",
+                     f"滚顶后仍看不到「{DM_PINNED}」置顶行,当前可见 {len(rows)} 行。\n"
+                     f"请确认该会话仍为置顶;私聊检测在恢复前处于失明状态。", shot)
     return False
 
 

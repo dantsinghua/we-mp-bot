@@ -31,6 +31,11 @@ except Exception:
     resolve_media = None
 
 try:
+    from wechat_media_resolve import ensure_canonical
+except Exception:
+    ensure_canonical = None
+
+try:
     import wechat_oa_resolve as oa
 except Exception:
     oa = None
@@ -40,6 +45,12 @@ try:
 except Exception:
     auto_reply = None
 
+try:
+    from wn_logging import get_logger
+    _dlog = get_logger("group2email")
+except Exception:
+    _dlog = None
+
 # 会话预览里的标记，用作「群名」与「群内发言」的边界
 MARK_RE = re.compile(
     r"(Stuck on Top|\d+\s+unread message\(s\)|\[You were mentioned\]|\[有人@我\])")
@@ -47,6 +58,11 @@ MARK_RE = re.compile(
 
 def log(m):
     print(f"[{time.strftime('%H:%M:%S')}] {m}", flush=True)
+    if _dlog is not None:
+        try:
+            _dlog.info(m)
+        except Exception:
+            pass
 
 
 def read_conversations():
@@ -178,14 +194,43 @@ def main():
     dm_kw = [k.strip() for k in args.dm.split(",") if k.strip()]
     msg_state, unread_state = {}, {}
     reply_state = {}         # 私聊每个对象最近一次自动回复文本，避免把自己的回复当新消息
+    cursor_state = {}        # 每个会话的游标锚块(最后K条消息序列)，洪峰补转/漏收补转用
+
+    def collect_group_new(who, cursor):
+        """洪峰路径:打开群聊按游标收新消息。返回 (msgs, truncated, new_cursor)；失败 (None, False, None)。"""
+        if auto_reply is None:
+            return None, False, None
+        from wechat_media_resolve import (find_group_scroll, _open_chat,
+                                          _scroll_list, current_chat_title)
+        _scroll_list("up", 12); time.sleep(0.5)
+        pos, _ = find_group_scroll(who)
+        if not pos or not _open_chat(pos):
+            return None, False, None
+        if current_chat_title() != who:      # 开窗校验
+            return None, False, None
+        hist = auto_reply.read_history()
+        if not hist:
+            return None, False, None
+        new, trunc = auto_reply.diff_since_cursor(hist, cursor)
+        return new, trunc, auto_reply.make_cursor(hist)
     oa_seen = set()          # 已转发过的公众号文章标题，去重
     oa_last = 0.0            # 上次处理订阅号的时间戳，用于节流
     log(f"转邮件已启动：群{group_kw} 私信{dm_kw} → {args.smtp_host}:{args.smtp_port} → {args.to_addr}"
         f"（前 {args.baseline_seconds:.0f}s 建基线）")
     baseline_rounds = max(1, int(args.baseline_seconds / max(args.interval, 0.5)))
+    def _alert(subject, body, shot=None):
+        log(f"⚠ 告警: {subject}")
+        try:
+            send_mail(cfg, subject, body, "告警", [shot] if shot else None)
+        except Exception as e:
+            log(f"  告警邮件发送失败: {e}")
+
     rounds = 0
     while True:
         try:
+            # S1/S2 规范态自愈+登录哨兵:置顶私聊行必须可见,否则滚顶;连续失败→告警
+            if ensure_canonical is not None and rounds >= baseline_rounds:
+                ensure_canonical(_alert)
             for raw, unread in read_conversations():
                 who, text = parse(raw)
                 # 公众号(订阅号)已由独立的 wemprss-bridge 图文全文桥接处理，这里不再转发(避免重复+旧列表格式)
@@ -217,30 +262,83 @@ def main():
                         continue
                     log(f"{kind}预览变化[{who}] → {text}")
                     try:
-                        reply, latest, sender = auto_reply.do_auto_reply(who)
+                        r = auto_reply.do_auto_reply(who, cursor_state.get(who))
                     except Exception as e:
                         log(f"  自动回复异常: {e}")
-                        reply, latest, sender = None, text, None
-                    if sender == "self":
-                        log("  最新是我自己发的(绿气泡/右头像)，跳过，不回复不转发")
+                        send_mail(cfg, who, text, kind)      # 异常退化:至少转发预览
                         continue
+                    sender = r["sender"]
                     if sender == "wrong_chat":
-                        log(f"  ⚠ 会话校验失败(当前窗口≠{who})，已中止回复，仅转发预览")
-                        send_mail(cfg, who, latest or text, kind)
+                        log(f"  ⚠ 会话校验失败(当前窗口≠{who})，已中止，仅转发预览")
+                        send_mail(cfg, who, text, kind)
                         continue
-                    body = latest or text
-                    if reply:
-                        reply_state[who] = reply
-                        log(f"  AI自动回复 → {reply}")
-                        body = f"{body}\n\n【AI老公自动回复】{reply}"
+                    if sender is None:
+                        log("  打不开会话/读空，仅转发预览")
+                        send_mail(cfg, who, text, kind)
+                        continue
+                    if r["cursor"]:
+                        cursor_state[who] = r["cursor"]
+                    peer_new = [m for m in r["new_msgs"] if m.get("sender") == "peer"]
+                    if sender == "self" and not peer_new:
+                        log("  最新是我自己发的且无漏收，跳过，不回复不转发")
+                        continue
+                    lines = [("[图片]" if m["kind"] == "image" else m["text"])
+                             for m in peer_new]
+                    body = "\n".join(lines) if lines else (r["latest"] or text)
+                    tags = []
+                    if len(lines) > 1:
+                        tags.append(f"补转 {len(lines)} 条")
+                    if r["truncated"]:
+                        tags.append("洪峰超窗，可能不全或含重复")
+                    if sender == "self":
+                        tags.append("你已手动回复，未生成AI回复")
+                        log(f"  最新是我自己发的；补转漏收 {len(lines)} 条")
+                    if r["reply"]:
+                        reply_state[who] = r["reply"]
+                        log(f"  AI自动回复 → {r['reply']}")
+                        body += f"\n\n【AI老公自动回复】{r['reply']}"
+                    if tags:
+                        body = f"【{'；'.join(tags)}】\n{body}"
                     send_mail(cfg, who, body, kind)
                     continue
 
                 # 群：沿用"未读数上涨"判定(天然区分收到 vs 自己发)
                 if (prev_u is not None and unread > prev_u
                         and text and text != prev_m):
-                    log(f"{kind}新消息[{who}] → {text}")
-                    # 图片/语音：打开群定位媒体消息，用 OpenClaw 多模态/转文字解析
+                    delta = unread - prev_u
+                    log(f"{kind}新消息[{who}] → {text}"
+                        + (f"  (未读+{delta})" if delta > 1 else ""))
+                    # 洪峰路径:一次涌入多条时只有最后一条在预览里,开群按游标补收全部
+                    if delta > 1:
+                        try:
+                            msgs, trunc, cur = collect_group_new(who, cursor_state.get(who))
+                        except Exception as e:
+                            log(f"  洪峰补收异常: {e}")
+                            msgs = None
+                        if msgs:
+                            if cur:
+                                cursor_state[who] = cur
+                            unread_state[who] = 0        # 开聊已读,未读清零(与增量判定自洽)
+                            lines = [("[图片]" if m["kind"] == "image" else m["text"])
+                                     for m in msgs]
+                            log(f"  洪峰补转 {len(lines)} 条" + (" (超窗)" if trunc else ""))
+                            head = (f"【洪峰补转 {len(lines)} 条，发言人未逐条标注"
+                                    + ("；可能不全或含重复】" if trunc else "】"))
+                            attachments = None
+                            if resolve_media and not args.no_media \
+                                    and ("[Photo]" in text or "[Audio]" in text):
+                                try:      # 最新一条含媒体仍走既有解析(带附件)
+                                    resolved, attachments = resolve_media(who, text)
+                                    if resolved != text:
+                                        log(f"  媒体解析 → {resolved}")
+                                        lines.append(f"※ 最新一条解析: {resolved}")
+                                except Exception as e:
+                                    log(f"  媒体解析异常: {e}")
+                            send_mail(cfg, who, head + "\n" + "\n".join(lines),
+                                      kind, attachments)
+                            continue
+                        log("  洪峰补收失败，退化为单条转发")
+                    # 单条路径:图片/语音打开群定位媒体消息，多模态/转文字解析
                     attachments = None
                     if resolve_media and not args.no_media \
                             and ("[Photo]" in text or "[Audio]" in text):
