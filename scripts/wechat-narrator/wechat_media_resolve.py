@@ -469,7 +469,14 @@ def chat_session(target, alert_cb=None):
     try:
         if not _open_chat(pos):
             raise ChatOpenError("open_failed")
-        if current_chat_title() != target:
+        # 标题(输入框)刷新有滞后,洪峰期尤甚:带缓冲重试再判,避免把"还没刷新"误判成开错会话
+        ok = False
+        for _ in range(4):
+            if current_chat_title() == target:
+                ok = True
+                break
+            time.sleep(0.6)
+        if not ok:
             raise ChatOpenError("wrong_chat")
         yield
     finally:
