@@ -197,22 +197,20 @@ def main():
     cursor_state = {}        # 每个会话的游标锚块(最后K条消息序列)，洪峰补转/漏收补转用
 
     def collect_group_new(who, cursor):
-        """洪峰路径:打开群聊按游标收新消息。返回 (msgs, truncated, new_cursor)；失败 (None, False, None)。"""
+        """洪峰路径:会话括号内按游标收新消息。返回 (msgs, truncated, new_cursor)；失败 (None, False, None)。"""
         if auto_reply is None:
             return None, False, None
-        from wechat_media_resolve import (find_group_scroll, _open_chat,
-                                          _scroll_list, current_chat_title)
-        _scroll_list("up", 12); time.sleep(0.5)
-        pos, _ = find_group_scroll(who)
-        if not pos or not _open_chat(pos):
+        from wechat_media_resolve import chat_session, ChatOpenError
+        try:
+            with chat_session(who):          # 进入即通过标题校验,退出必归一化
+                time.sleep(1.0)
+                hist = auto_reply.read_history()
+                if not hist:
+                    return None, False, None
+                new, trunc = auto_reply.diff_since_cursor(hist, cursor)
+                return new, trunc, auto_reply.make_cursor(hist)
+        except ChatOpenError:
             return None, False, None
-        if current_chat_title() != who:      # 开窗校验
-            return None, False, None
-        hist = auto_reply.read_history()
-        if not hist:
-            return None, False, None
-        new, trunc = auto_reply.diff_since_cursor(hist, cursor)
-        return new, trunc, auto_reply.make_cursor(hist)
     oa_seen = set()          # 已转发过的公众号文章标题，去重
     oa_last = 0.0            # 上次处理订阅号的时间戳，用于节流
     log(f"转邮件已启动：群{group_kw} 私信{dm_kw} → {args.smtp_host}:{args.smtp_port} → {args.to_addr}"

@@ -141,6 +141,19 @@ def wechat_state():
         return "logged_in"
     if login_btns:
         return "login"
+    # 二维码登录界面无任何按钮(仅"Scan to log in"文字标签,AT-SPI 不一定暴露)——
+    # 用窗口几何兜底:存在 292x396 级别的 Weixin 小窗即视为待登录(2026-07-14 盲区修复)
+    try:
+        out = subprocess.run(["xdotool", "search", "--name", "^Weixin$"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        for wid in out:
+            g = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                               capture_output=True, text=True, timeout=10).stdout
+            m = dict(re.findall(r"(\w+)=(\S+)", g))
+            if 200 < int(m.get("WIDTH", 0)) < 450 and 300 < int(m.get("HEIGHT", 0)) < 500:
+                return "login"
+    except Exception:
+        pass
     return "unknown"
 
 

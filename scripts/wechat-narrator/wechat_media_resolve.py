@@ -211,21 +211,27 @@ def transcribe_voice():
     if already:                      # 已转写过，直接读
         return already
     # 右键语音气泡(群对方消息靠左，气泡在行左下部) → 键盘激活第一项 Audio to Text
-    subprocess.run(["xdotool", "mousemove", str(x + 95), str(y + h - 22), "click", "3"])
-    time.sleep(1.3)
-    subprocess.run(["xdotool", "key", "Down"]); time.sleep(0.4)
-    subprocess.run(["xdotool", "key", "Return"]); time.sleep(0.3)
-    for _ in range(20):              # 轮询最多 ~30s
-        time.sleep(1.5)
-        cur = _latest_audio()
-        if not cur:
-            continue
-        if "conversion failed" in cur[1].lower():
-            return None
-        txt = _voice_text(cur[1])
-        if txt:
-            return txt
-    return None
+    # 契约:无论成败,finally 必 Esc——残留的右键菜单会毒害后续一切动作
+    try:
+        subprocess.run(["xdotool", "mousemove", str(x + 95), str(y + h - 22), "click", "3"])
+        time.sleep(1.3)
+        subprocess.run(["xdotool", "key", "Down"]); time.sleep(0.4)
+        subprocess.run(["xdotool", "key", "Return"]); time.sleep(0.3)
+        for _ in range(20):              # 轮询最多 ~30s
+            time.sleep(1.5)
+            cur = _latest_audio()
+            if not cur:
+                continue
+            if "conversion failed" in cur[1].lower():
+                return None
+            txt = _voice_text(cur[1])
+            if txt:
+                return txt
+        return None
+    finally:
+        subprocess.run(["xdotool", "key", "Escape"],
+                       env={**os.environ, "DISPLAY": DISPLAY})
+        time.sleep(0.2)
 
 
 def _scroll_list(direction, times=4):
@@ -273,6 +279,79 @@ def _chat_loaded():
 DM_PINNED = os.environ.get("WN_DM_PINNED", "灰灰")   # 置顶私聊,规范态锚点(须保持置顶)
 _canon = {"fails": 0, "last_alert": 0.0}
 
+# ---- 状态机(2026-07-14 重构):标准态 + 原子动作交接契约 ----
+# 休息态只有两个:READY(列表顶部/置顶行可见/无弹窗)与 LOGGED_OUT(登录窗)。
+# CHAT_OPEN 是瞬态,只允许存在于 chat_session 括号内部。
+# 注:该微信客户端的聊天面板无法真正关闭(Esc 不关,7/9 实证),故 READY 允许
+# 面板残留内容——它是惰性的:所有消费方(open_chat/send/read)都强制校验标题,
+# 绝不使用未经校验的残留会话。
+READY, LOGGED_OUT, CHAT_OPEN, UNKNOWN = "READY", "LOGGED_OUT", "CHAT_OPEN", "UNKNOWN"
+
+
+class ChatOpenError(Exception):
+    """chat_session 进入失败。reason: LOGGED_OUT/UNKNOWN/not_found/open_failed/wrong_chat"""
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _login_window():
+    """微信登录小窗(292x396 级别)的 window id;没有返回 None。"""
+    try:
+        out = subprocess.run(["xdotool", "search", "--name", "^Weixin$"],
+                             env={**os.environ, "DISPLAY": DISPLAY},
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        for wid in out:
+            g = subprocess.run(["xdotool", "getwindowgeometry", "--shell", wid],
+                               env={**os.environ, "DISPLAY": DISPLAY},
+                               capture_output=True, text=True, timeout=10).stdout
+            m = dict(re.findall(r"(\w+)=(\S+)", g))
+            if 200 < int(m.get("WIDTH", 0)) < 450 and 300 < int(m.get("HEIGHT", 0)) < 500:
+                return wid
+    except Exception:
+        pass
+    return None
+
+
+def detect_state():
+    """纯只读分类当前状态,不动 UI。返回 (state, detail)。"""
+    rows = _list_rows()
+    if rows:
+        t = current_chat_title()
+        return (CHAT_OPEN, t) if t else (READY, None)
+    if _login_window():
+        return (LOGGED_OUT, None)
+    return (UNKNOWN, None)
+
+
+def _dismiss_kick_dialog():
+    """被顶号后的 Tip 弹窗(OK 按钮)存在则点掉,露出二维码。返回是否点了。"""
+    try:
+        for a in _apps():
+            stack = [a]
+            while stack:
+                n = stack.pop()
+                try:
+                    nm = (n.name or "").strip().lower()
+                    if (n.getRoleName() == "push button" and nm in ("ok", "确定")
+                            and n.getState().contains(pyatspi.STATE_SHOWING)):
+                        e = n.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                        if e.width > 0:
+                            subprocess.run(["xdotool", "mousemove",
+                                            str(e.x + e.width // 2),
+                                            str(e.y + e.height // 2), "click", "1"],
+                                           env={**os.environ, "DISPLAY": DISPLAY})
+                            time.sleep(1.0)
+                            return True
+                    for c in n:
+                        if c:
+                            stack.append(c)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
 
 def _list_rows():
     """左侧会话列表当前可见的行 [(y, name)]。"""
@@ -310,41 +389,95 @@ def _forensic_shot(tag):
         return None
 
 
-def ensure_canonical(alert_cb=None):
-    """规范态自愈:会话列表须在顶部、置顶私聊行(DM_PINNED)可见。
+def to_ready(alert_cb=None):
+    """归一化到标准态。返回 READY / LOGGED_OUT / UNKNOWN。系统的"重力"。
 
-    背景(2026-07-11/13 两次私聊失明):微信打开列表下方会话时会自动滚动列表,
-    置顶区被顶出视口后轮询对私聊行全盲。本函数每轮轮询前调用:
-      可见 → 直接返回 True(一次 AT-SPI 读,零扰动);
-      不可见 → 滚顶自愈再查;连续 2 次自愈失败 → 截图 + alert_cb 告警(限频 1 次/小时)。
-    行数为 0 视作可能掉线(登录哨兵),同样走告警路径。
+    - 置顶行可见 → READY(快路径,一次 AT-SPI 读,零扰动);
+    - 置顶行不可见 → Esc 清可能的菜单/浮层 → 滚到绝对顶部(30 次,任意漂移深度)再查;
+    - 行数为 0 → 点掉可能的顶号 Tip 弹窗再查;仍为 0 且有登录小窗 → LOGGED_OUT
+      (限频告警,提示扫码);
+    - 连续 2 轮自愈失败 → 截图取证 + 告警,返回 UNKNOWN。
+    背景:7/11、7/13 私聊失明(微信自动滚动列表把置顶区顶出视口),7/13 顶号掉线。
     alert_cb(subject, body, attachment_path_or_None)
     """
     rows = _list_rows()
     if any(nm.startswith(DM_PINNED) for _, nm in rows):
         _canon["fails"] = 0
-        return True
-    # 滚到绝对顶部:漂移深度不定(打开靠下的群会滚很远),固定次数可能回不到顶;
-    # 列表到顶后多余滚动是无副作用空操作,故用足量次数保证到顶。
+        return READY
+    if not rows:
+        if _dismiss_kick_dialog():          # 顶号 Tip:点 OK 露出二维码
+            rows = _list_rows()
+        if not rows and _login_window():
+            _canon["fails"] = 0             # 掉线是明确态,不算自愈失败
+            if alert_cb and time.time() - _canon["last_alert"] > 3600:
+                _canon["last_alert"] = time.time()
+                alert_cb("微信已掉线,需要重新扫码登录",
+                         "登录窗已出现。对 Claude 说「出二维码」即可扫码恢复。",
+                         _forensic_shot("logout"))
+            return LOGGED_OUT
+    # 自愈:清瞬态 + 滚顶(列表到顶后多余滚动是无副作用空操作)
+    subprocess.run(["xdotool", "key", "Escape"],
+                   env={**os.environ, "DISPLAY": DISPLAY})
     _scroll_list("up", 30)
     time.sleep(0.8)
     rows = _list_rows()
     if any(nm.startswith(DM_PINNED) for _, nm in rows):
         _canon["fails"] = 0
-        return True
+        return READY
     _canon["fails"] += 1
     if _canon["fails"] >= 2 and alert_cb and time.time() - _canon["last_alert"] > 3600:
         _canon["last_alert"] = time.time()
         shot = _forensic_shot("canon")
         if not rows:
-            alert_cb("微信可能已掉线(会话列表为空)",
-                     "连续 2 轮读不到任何会话行——大概率被登出或有弹窗遮挡。\n"
-                     "请查看取证截图;需要扫码对 Claude 说「出二维码」。", shot)
+            alert_cb("微信状态异常(会话列表为空且无登录窗)",
+                     "连续 2 轮读不到会话行,也不是登录界面——可能有弹窗遮挡。\n"
+                     "请查看取证截图。", shot)
         else:
             alert_cb(f"规范态自愈失败({DM_PINNED} 行不可见)",
                      f"滚顶后仍看不到「{DM_PINNED}」置顶行,当前可见 {len(rows)} 行。\n"
                      f"请确认该会话仍为置顶;私聊检测在恢复前处于失明状态。", shot)
-    return False
+    return UNKNOWN
+
+
+def ensure_canonical(alert_cb=None):
+    """兼容旧调用名:to_ready 的布尔视图。"""
+    return to_ready(alert_cb) == READY
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def chat_session(target, alert_cb=None):
+    """会话括号:唯一合法进入 CHAT_OPEN(target) 的方式。
+
+    进入:to_ready 归一化 → 会话列表定位(仅列表行) → 点击 → 标题==target 强校验;
+         任一步失败 raise ChatOpenError(reason),绝不在错误会话上继续。
+    退出:无论正常/异常,finally 必 Esc(关右键菜单/查看器等瞬态) + 滚顶,
+         把系统交还到 READY 邻域(残留聊天面板是惰性的,见模块头注释)。
+    括号内可自由串接 read_history/capture_image/transcribe_voice/send_reply。
+    """
+    st = to_ready(alert_cb)
+    if st != READY:
+        raise ChatOpenError(st)
+    pos = find_group_coord(target)
+    if not pos:
+        pos, _ = find_group_scroll(target)
+    if not pos:
+        _scroll_list("up", 30)
+        raise ChatOpenError("not_found")
+    try:
+        if not _open_chat(pos):
+            raise ChatOpenError("open_failed")
+        if current_chat_title() != target:
+            raise ChatOpenError("wrong_chat")
+        yield
+    finally:
+        subprocess.run(["xdotool", "key", "Escape"],
+                       env={**os.environ, "DISPLAY": DISPLAY})
+        time.sleep(0.3)
+        _scroll_list("up", 30)
+        time.sleep(0.3)
 
 
 def find_input_box():
@@ -392,38 +525,25 @@ def resolve_media(group_name, text):
 
     返回 (增强后的 text, 附件文件路径列表)。图片会被截图存成文件，
     既替换占位为文字描述，也作为附件路径返回供邮件挂附件；语音走微信自带转文字。
+    状态机契约:UI 操作全部包在 chat_session 括号内(退出必归一化);
+    多模态描述是态中立的网络调用,放在括号外算,缩短占用 UI 的时间窗。
     """
     if "[Photo]" not in text and "[Audio]" not in text:
         return text, []
-    pos, scrolled = find_group_scroll(group_name)
-    if not pos:
-        if scrolled:
-            _scroll_list("up", scrolled * 4 + 4)   # 滚回会话列表顶部
-        return text, []
-    if not _open_chat(pos):                          # 点击落空(聊天区空白)则重试
-        if scrolled:
-            _scroll_list("up", scrolled * 4 + 4)
-        return text, []
-    if current_chat_title() != group_name:           # 开窗校验：必须就是目标群
-        if scrolled:
-            _scroll_list("up", scrolled * 4 + 4)
-        return text, []
-    out, attachments = text, []
+    out, attachments, png = text, [], None
     try:
-        if "[Photo]" in out:
-            png = capture_image(group_name)
-            if png:
-                attachments.append(png)
-                desc = describe_image(png)
-                out = out.replace("[Photo]", f"[图片: {desc}]" if desc else "[图片(见附件)]")
-        if "[Audio]" in out:
-            txt = transcribe_voice()
-            if txt:
-                out = out.replace("[Audio]", f"[语音: {txt}]")
-    finally:
-        subprocess.run(["xdotool", "key", "Escape"])
-        time.sleep(0.5)
-        if scrolled:
-            _scroll_list("up", scrolled * 4 + 4)   # 滚回会话列表顶部，避免干扰轮询
-        time.sleep(0.5)
+        with chat_session(group_name):
+            if "[Photo]" in out:
+                png = capture_image(group_name)
+                if png:
+                    attachments.append(png)
+            if "[Audio]" in out:
+                txt = transcribe_voice()
+                if txt:
+                    out = out.replace("[Audio]", f"[语音: {txt}]")
+    except ChatOpenError:
+        return text, []
+    if png:
+        desc = describe_image(png)          # 括号外:纯网络,不碰窗口
+        out = out.replace("[Photo]", f"[图片: {desc}]" if desc else "[图片(见附件)]")
     return out, attachments

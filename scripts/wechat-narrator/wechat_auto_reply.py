@@ -290,47 +290,42 @@ def do_auto_reply(peer=PEER, cursor=None):
     "最新是 self"不再整体跳过——new_msgs 仍带回漏收的对方消息(修 7/12 丢照片问题)。
     回复保鲜:LLM 生成期间对方又发新消息 → 用新历史重新生成一次(仅一次)。
     """
-    from wechat_media_resolve import (find_group_coord, find_group_scroll,
-                                      _open_chat, _scroll_list, current_chat_title)
+    from wechat_media_resolve import chat_session, ChatOpenError
     out = {"reply": None, "latest": None, "sender": None,
            "new_msgs": [], "cursor": None, "truncated": False}
-    _scroll_list("up", 12); time.sleep(0.5)
-    pos = find_group_coord(peer)
-    if not pos:
-        pos, _ = find_group_scroll(peer)
-    if not pos:
-        return out
-    _open_chat(pos); time.sleep(1.5)
-    if current_chat_title() != peer:     # 开窗校验：打开的必须就是 peer 的会话
-        out["sender"] = "wrong_chat"
-        return out
-    hist = []
-    for _ in range(3):                 # AT-SPI 时序：读空则重试
-        hist = read_history()
-        if hist:
-            break
-        time.sleep(1)
-    if not hist:
-        return out
-    out["new_msgs"], out["truncated"] = diff_since_cursor(hist, cursor)
-    out["latest"] = _latest_text(hist)
-    out["sender"] = hist[-1].get("sender")
-    if out["sender"] == "peer":
-        reply = generate_reply(hist)
-        fresh = read_history()           # 保鲜:期间又来新消息则重生成一次
-        if (reply and fresh and fresh[-1].get("sender") == "peer"
-                and fresh[-1]["text"] != hist[-1]["text"]):
-            hist = fresh
-            out["new_msgs"], t2 = diff_since_cursor(hist, cursor)
-            out["truncated"] = out["truncated"] or t2
+    try:
+        with chat_session(peer):         # 会话括号:进入即已通过标题校验,退出必归一化
+            time.sleep(1.0)
+            hist = []
+            for _ in range(3):           # AT-SPI 时序：读空则重试
+                hist = read_history()
+                if hist:
+                    break
+                time.sleep(1)
+            if not hist:
+                return out
+            out["new_msgs"], out["truncated"] = diff_since_cursor(hist, cursor)
             out["latest"] = _latest_text(hist)
-            reply = generate_reply(hist)
-        if reply and not send_reply(reply, peer):
-            out["sender"] = "wrong_chat"   # 发送闸门拦截:未发出,游标不前进
+            out["sender"] = hist[-1].get("sender")
+            if out["sender"] == "peer":
+                reply = generate_reply(hist)
+                fresh = read_history()   # 保鲜:期间又来新消息则重生成一次
+                if (reply and fresh and fresh[-1].get("sender") == "peer"
+                        and fresh[-1]["text"] != hist[-1]["text"]):
+                    hist = fresh
+                    out["new_msgs"], t2 = diff_since_cursor(hist, cursor)
+                    out["truncated"] = out["truncated"] or t2
+                    out["latest"] = _latest_text(hist)
+                    reply = generate_reply(hist)
+                if reply and not send_reply(reply, peer):
+                    out["sender"] = "wrong_chat"   # 发送闸门拦截:未发出,游标不前进
+                    return out
+                out["reply"] = reply
+            out["cursor"] = make_cursor(hist)
             return out
-        out["reply"] = reply
-    out["cursor"] = make_cursor(hist)
-    return out
+    except ChatOpenError as e:
+        out["sender"] = "wrong_chat" if e.reason == "wrong_chat" else None
+        return out
 
 
 if __name__ == "__main__":
