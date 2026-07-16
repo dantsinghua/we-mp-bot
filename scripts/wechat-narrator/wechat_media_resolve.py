@@ -20,6 +20,31 @@ import urllib.request
 
 import pyatspi
 
+try:
+    from wn_logging import get_logger
+    _slog = get_logger("statemachine")
+except Exception:
+    _slog = None
+
+# 原子动作 trace:同一次会话操作串一个短 id,便于把 open→verify→exit 关联起来。
+# 不用随机数(harness 禁 random),用单调计数 + 进程 pid 拼。
+_trace = {"n": 0}
+
+
+def _tid():
+    _trace["n"] += 1
+    return f"{os.getpid()%10000:04d}-{_trace['n']:04d}"
+
+
+def _sl(tid, msg, level="info"):
+    """状态机原子动作日志 → logs/statemachine.log(带日期毫秒,30天滚动)。"""
+    if _slog is None:
+        return
+    try:
+        getattr(_slog, level)(f"[{tid}] {msg}")
+    except Exception:
+        pass
+
 
 def _secret(name, default=""):
     """密钥读取：环境变量优先，其次 ~/.wechat-narrator/secrets.json（仓库外，0600）。"""
@@ -405,15 +430,19 @@ def to_ready(alert_cb=None):
     背景:7/11、7/13 私聊失明(微信自动滚动列表把置顶区顶出视口),7/13 顶号掉线。
     alert_cb(subject, body, attachment_path_or_None)
     """
+    tid = _tid()
     rows = _list_rows()
     if any(nm.startswith(DM_PINNED) for _, nm in rows):
         _canon["fails"] = 0
+        _sl(tid, f"to_ready→READY 快路径(可见{len(rows)}行,置顶行在)")
         return READY
     if not rows:
         if _dismiss_kick_dialog():          # 顶号 Tip:点 OK 露出二维码
+            _sl(tid, "点掉顶号Tip弹窗")
             rows = _list_rows()
         if not rows and _login_window():
             _canon["fails"] = 0             # 掉线是明确态,不算自愈失败
+            _sl(tid, "to_ready→LOGGED_OUT(登录窗存在)", "warning")
             if alert_cb and time.time() - _canon["last_alert"] > 3600:
                 _canon["last_alert"] = time.time()
                 alert_cb("微信已掉线,需要重新扫码登录",
@@ -421,6 +450,7 @@ def to_ready(alert_cb=None):
                          _forensic_shot("logout"))
             return LOGGED_OUT
     # 自愈:清瞬态 + 滚顶(列表到顶后多余滚动是无副作用空操作)
+    _sl(tid, f"to_ready 置顶行不可见(可见{len(rows)}行)→ Esc+滚顶自愈")
     subprocess.run(["xdotool", "key", "Escape"],
                    env={**os.environ, "DISPLAY": DISPLAY})
     _scroll_list("up", 30)
@@ -428,8 +458,10 @@ def to_ready(alert_cb=None):
     rows = _list_rows()
     if any(nm.startswith(DM_PINNED) for _, nm in rows):
         _canon["fails"] = 0
+        _sl(tid, f"to_ready→READY 自愈成功(可见{len(rows)}行)")
         return READY
     _canon["fails"] += 1
+    _sl(tid, f"to_ready→UNKNOWN 自愈失败#{_canon['fails']}(可见{len(rows)}行)", "warning")
     if _canon["fails"] >= 2 and alert_cb and time.time() - _canon["last_alert"] > 3600:
         _canon["last_alert"] = time.time()
         shot = _forensic_shot("canon")
@@ -462,26 +494,33 @@ def chat_session(target, alert_cb=None):
          把系统交还到 READY 邻域(残留聊天面板是惰性的,见模块头注释)。
     括号内可自由串接 read_history/capture_image/transcribe_voice/send_reply。
     """
+    tid = _tid()
+    _sl(tid, f"chat_session('{target}') 进入")
     st = to_ready(alert_cb)
     if st != READY:
+        _sl(tid, f"chat_session 中止:前置态={st}(非READY)", "warning")
         raise ChatOpenError(st)
     pos = find_group_coord(target)
     if not pos:
         pos, _ = find_group_scroll(target)
     if not pos:
+        _sl(tid, f"chat_session 中止:列表定位不到'{target}'", "warning")
         _scroll_list("up", 30)
         raise ChatOpenError("not_found")
     try:
         if not _open_chat(pos):
+            _sl(tid, "chat_session 中止:点击后聊天区未加载(open_failed)", "warning")
             raise ChatOpenError("open_failed")
         # 标题(输入框)刷新有滞后,洪峰期尤甚:带缓冲重试再判,避免把"还没刷新"误判成开错会话
-        ok = False
-        for _ in range(4):
-            if current_chat_title() == target:
-                ok = True
+        seen = None
+        for i in range(4):
+            seen = current_chat_title()
+            if seen == target:
+                _sl(tid, f"chat_session→CHAT_OPEN('{target}') 校验通过(第{i+1}次)")
                 break
             time.sleep(0.6)
-        if not ok:
+        else:
+            _sl(tid, f"chat_session 中止:标题校验失败 want='{target}' got='{seen}'(重试4次)", "warning")
             raise ChatOpenError("wrong_chat")
         yield
     finally:
@@ -490,6 +529,7 @@ def chat_session(target, alert_cb=None):
         time.sleep(0.3)
         _scroll_list("up", 30)
         time.sleep(0.3)
+        _sl(tid, f"chat_session('{target}') 退出→归一化(Esc+滚顶)")
 
 
 def find_input_box():

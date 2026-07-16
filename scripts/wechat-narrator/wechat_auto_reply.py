@@ -259,9 +259,11 @@ def send_reply(text, peer=PEER):
     最后闸门(2026-07-09 误发进群事故)：点击输入框前、回车发送前两次校验
     「输入框 name(=当前聊天标题) == peer」，任一不匹配立即中止返回 False——
     宁可不发，绝不发错会话。输入框坐标实取节点 extents，不再盲点固定坐标。"""
-    from wechat_media_resolve import find_input_box
+    from wechat_media_resolve import find_input_box, _sl, _tid
+    tid = _tid()
     title, box = find_input_box()
     if title != peer or not box:
+        _sl(tid, f"send_reply 闸门1拒发:输入框标题='{title}' != peer='{peer}'", "warning")
         return False
     x, y, w, h = box
     # 直接管道写剪贴板，避免 shell 对中文/特殊字符转义
@@ -270,9 +272,12 @@ def send_reply(text, peer=PEER):
     subprocess.run(["xdotool", "mousemove", str(x + w // 2), str(y + h // 2),
                     "click", "1"]); time.sleep(0.3)
     subprocess.run(["xdotool", "key", "ctrl+v"]); time.sleep(0.5)
-    if find_input_box()[0] != peer:      # 粘贴后、回车前终检
+    t2 = find_input_box()[0]
+    if t2 != peer:      # 粘贴后、回车前终检
+        _sl(tid, f"send_reply 闸门2拒发:粘贴后标题='{t2}' != peer='{peer}'", "warning")
         return False
     subprocess.run(["xdotool", "key", "Return"]); time.sleep(0.6)
+    _sl(tid, f"send_reply→已发送 peer='{peer}' ({len(text)}字)")
     return True
 
 

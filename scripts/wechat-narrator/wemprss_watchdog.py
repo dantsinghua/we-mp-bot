@@ -24,9 +24,12 @@ os.makedirs(LOG_DIR, exist_ok=True)
 LOG = os.path.join(LOG_DIR, "watchdog.log")
 STAMP_RESTART = os.path.join(LOG_DIR, ".wd_last_restart")
 STAMP_AUTH = os.path.join(LOG_DIR, ".wd_last_auth_alert")
+STAMP_UPSTREAM = os.path.join(LOG_DIR, ".wd_last_upstream_alert")
 PATCH_SH = os.path.join(HOME, "clawd", "scripts", "wechat-narrator", "wemprss_patch.sh")
 
-INGEST_STALE_H = 6
+INGEST_STALE_H = 6        # created_at 停滞阈值 → 本地卡死,重启
+UPSTREAM_STALE_H = 5      # publish_time 停滞阈值(created_at 仍新鲜) → 上游限流,只告警
+UPSTREAM_ALERT_GAP = 6 * 3600
 MEM_LIMIT = 1.7 * 1024**3
 RESTART_MIN_GAP = 2 * 3600
 AUTH_ALERT_GAP = 6 * 3600
@@ -62,6 +65,29 @@ def container_py(code, timeout=30):
     r = subprocess.run(["docker", "exec", "-i", "we-mp-rss", "python3", "-"],
                        input=code, capture_output=True, text=True, timeout=timeout)
     return r.returncode, (r.stdout or "").strip()
+
+
+def _local_broken():
+    """本地故障实证:僵尸 playwright/node 进程(>20min) / 内存超限 / 近期崩溃日志。
+    有实证才对入库停滞做重启;否则视为上游限流(重启无用)。"""
+    # 僵尸浏览器/driver:etime 超过 20 分钟的 node/firefox(正常抓取几十秒内结束)
+    rc, out, _ = sh("docker exec we-mp-rss sh -c \"ps -eo etimes,comm | "
+                    "grep -E 'node|firefox' | awk '$1>1200{print}'\" 2>/dev/null || true")
+    if out.strip():
+        log(f"local_broken: 僵尸浏览器进程 {out.strip()[:80]}")
+        return True
+    # 内存逼近上限(OOM 前兆)
+    rc, out, _ = sh("docker exec we-mp-rss cat /sys/fs/cgroup/memory.current 2>/dev/null")
+    if rc == 0 and out.isdigit() and int(out) > MEM_LIMIT:
+        log(f"local_broken: 内存 {int(out)/1024**3:.2f}G > 限")
+        return True
+    # 近期 Python traceback / 崩溃
+    rc, out, _ = sh("docker logs we-mp-rss --since 40m 2>&1 | "
+                    "grep -acE 'Traceback|CRITICAL|OOM' || true")
+    if out.isdigit() and int(out) > 0:
+        log(f"local_broken: 近40min {out} 条崩溃日志")
+        return True
+    return False
 
 
 def alert(subject, body):
@@ -118,17 +144,44 @@ def main():
         return
 
     # 1. ingest staleness (created_at stored in LOCAL time (CST) -> 'utc' modifier converts to epoch)
+    #    关键:入库停滞可能是 (a) 本地卡死 或 (b) 上游限流(限流时上游不返回=也不产生新行)。
+    #    单靠 created_at 停滞无法区分,故本地卡死重启必须带**本地故障实证**(下方 local_broken),
+    #    否则一律按上游限流处理(只告警,不重启——重启对限流无用且增加请求)。
+    age_h = None
+    broken = _local_broken()
     rc, out = container_py(
         "import sqlite3\n"
         "c = sqlite3.connect('file:/app/data/db.db?mode=ro', uri=True, timeout=5)\n"
         "print(c.execute(\"SELECT strftime('%s', MAX(created_at), 'utc') FROM articles\").fetchone()[0])\n")
     if rc == 0 and out and out != "None":
         age_h = (time.time() - int(out)) / 3600
-        log(f"ingest age: {age_h:.1f}h")
-        if age_h > INGEST_STALE_H:
-            restart_container(f"入库停滞 {age_h:.1f} 小时")
+        log(f"ingest age(created_at): {age_h:.1f}h, local_broken={broken}")
+        if age_h > INGEST_STALE_H and broken:
+            restart_container(f"本地卡死实证+入库停滞 {age_h:.1f}h")
+        elif age_h > INGEST_STALE_H:
+            log(f"入库停滞 {age_h:.1f}h 但容器健康 → 判上游限流,不重启(见 1b 告警)")
     else:
         log(f"ingest check failed rc={rc} out={out!r}")
+
+    # 1b. 上游限流判别:publish_time 冻结但 created_at 仍在动 = 微信软限流(风控),
+    #     重启无用(限流在微信端),甚至有害(增加请求)→ 只限频告警,不重启。
+    rc, out = container_py(
+        "import sqlite3\n"
+        "c = sqlite3.connect('file:/app/data/db.db?mode=ro', uri=True, timeout=5)\n"
+        "print(c.execute(\"SELECT MAX(publish_time) FROM articles\").fetchone()[0])\n")
+    if rc == 0 and out and out.isdigit():
+        pub_age_h = (time.time() - int(out)) / 3600
+        log(f"publish freshness: {pub_age_h:.1f}h")
+        if pub_age_h > UPSTREAM_STALE_H and not broken:
+            if stamp_ok(STAMP_UPSTREAM, UPSTREAM_ALERT_GAP):
+                touch(STAMP_UPSTREAM)
+                alert("公众号疑似被微信限流(风控)",
+                      f"最新文章发布已 {pub_age_h:.1f} 小时前,但采集仍在回填旧文"
+                      f"(created_at 新鲜)——典型微信软限流,非本地故障。\n"
+                      "不重启容器(重启无用且增加请求)。通常数小时自愈;"
+                      "已把采集降频到每3小时以缓解。")
+            else:
+                log(f"upstream rate-limit suspected ({pub_age_h:.1f}h), alert rate-limited")
 
     # 2. memory
     rc, out, _ = sh("docker exec we-mp-rss cat /sys/fs/cgroup/memory.current")
