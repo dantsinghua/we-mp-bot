@@ -124,7 +124,16 @@ def send_mail(cfg, name, speaker_and_text, kind="群", attachments=None):
                 log(f"附件失败 {p}: {e}")
     else:
         msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = Header(f"[微信{kind}] {name}", "utf-8")
+    # Outlook 分类头:告警类(kind=告警)标紧急,其余是正常转发内容
+    if kind == "告警":
+        msg["Subject"] = Header(f"[紧急][状态机] {name}", "utf-8")
+        msg["X-WN-Category"] = "statemachine"
+        msg["X-WN-Severity"] = "urgent"
+    else:
+        msg["Subject"] = Header(f"[微信{kind}] {name}", "utf-8")
+        msg["X-WN-Category"] = "forward"
+        msg["X-WN-Severity"] = "info"
+    msg["X-WN-Source"] = "group2email"
     msg["From"] = cfg["from_addr"]
     msg["To"] = cfg["to_addr"]
     msg["Date"] = formatdate(localtime=True)

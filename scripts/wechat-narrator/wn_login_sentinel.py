@@ -153,9 +153,12 @@ def send_logout_mail():
     """Email the logout alert with a freshly-grabbed QR (inline + attached) and web link."""
     qr_file = capture_login_qr() or (QR_PATH if os.path.exists(QR_PATH) else None)
     msg = MIMEMultipart("related")
-    msg["Subject"] = Header("🔴 微信已掉线,请重新扫码登录", "utf-8")
+    msg["Subject"] = Header("[紧急][微信登录] 微信已掉线,请重新扫码登录", "utf-8")
     msg["From"] = MAIL_FROM
     msg["To"] = MAIL_TO
+    msg["X-WN-Category"] = "login"
+    msg["X-WN-Severity"] = "urgent"
+    msg["X-WN-Source"] = "login-sentinel"
 
     qr_ok = bool(qr_file)
     inline = ('<p><img src="cid:qr" style="width:260px;image-rendering:pixelated;'

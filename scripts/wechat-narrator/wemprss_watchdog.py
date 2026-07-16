@@ -90,12 +90,17 @@ def _local_broken():
     return False
 
 
-def alert(subject, body):
+def alert(subject, body, severity="urgent"):
+    # Outlook 分类:主题带 [紧急]/[提醒]<类别> 标签 + X-WN-* 头(可按头建规则)。
     try:
+        tag = "[紧急]" if severity == "urgent" else "[提醒]"
         msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = Header(f"⚠ [watchdog] {subject}", "utf-8")
+        msg["Subject"] = Header(f"{tag}[公众号] {subject}", "utf-8")
         msg["From"] = "wechat-narrator@test.local"
         msg["To"] = "wechat-narrator@test.local"
+        msg["X-WN-Category"] = "oa"
+        msg["X-WN-Severity"] = severity
+        msg["X-WN-Source"] = "watchdog"
         s = smtplib.SMTP("127.0.0.1", 3025, timeout=15)
         s.sendmail(msg["From"], [msg["To"]], msg.as_string())
         s.quit()
@@ -179,7 +184,7 @@ def main():
                       f"最新文章发布已 {pub_age_h:.1f} 小时前,但采集仍在回填旧文"
                       f"(created_at 新鲜)——典型微信软限流,非本地故障。\n"
                       "不重启容器(重启无用且增加请求)。通常数小时自愈;"
-                      "已把采集降频到每3小时以缓解。")
+                      "已把采集降频到每3小时以缓解。", severity="warning")
             else:
                 log(f"upstream rate-limit suspected ({pub_age_h:.1f}h), alert rate-limited")
 

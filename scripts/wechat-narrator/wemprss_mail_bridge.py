@@ -334,6 +334,9 @@ def build_and_send(cfg, art, cleaned_text, imgmap):
     msg["From"] = cfg["from_addr"]
     msg["To"] = cfg["to_addr"]
     msg["Date"] = formatdate(localtime=True)
+    msg["X-WN-Category"] = "oa-article"   # Outlook 分类:公众号全文,与告警区分
+    msg["X-WN-Severity"] = "info"
+    msg["X-WN-Source"] = "wemprss-bridge"
     alt = MIMEMultipart("alternative")
     alt.attach(MIMEText(html_body, "html", "utf-8"))
     msg.attach(alt)
