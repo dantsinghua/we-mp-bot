@@ -1,0 +1,36 @@
+#!/bin/bash
+# safe-pkill: like `pkill -f <pattern>` but NEVER kills the calling shell or any
+# of its ancestors (the recurring self-kill bug: a pattern that appears in the
+# executing shell's own cmdline makes `pkill -f` terminate that shell, exit 144).
+#
+# Usage: safe-pkill <pattern> [signal]     (signal defaults to TERM; e.g. KILL)
+# Excludes: this script's PID, its entire ancestor chain up to init, and pgrep.
+set -u
+pat="${1:-}"
+sig="${2:-TERM}"
+if [ -z "$pat" ]; then
+  echo "usage: safe-pkill <pattern> [signal]" >&2
+  exit 2
+fi
+
+# Build the exclusion set: self + every ancestor up the process tree.
+excl=" $$ "
+pid=$$
+while [ "${pid:-0}" -gt 1 ]; do
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+  [ -z "$ppid" ] && break
+  excl="$excl$ppid "
+  pid=$ppid
+done
+
+killed=0
+for target in $(pgrep -f -- "$pat" 2>/dev/null); do
+  case "$excl" in
+    *" $target "*) continue ;;   # skip self / ancestors
+  esac
+  if kill -"$sig" "$target" 2>/dev/null; then
+    killed=$((killed + 1))
+  fi
+done
+echo "safe-pkill: signalled $killed process(es) matching '$pat' (SIG$sig; excluded self+ancestors)"
+exit 0
