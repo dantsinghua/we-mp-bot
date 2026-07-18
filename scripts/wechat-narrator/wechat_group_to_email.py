@@ -51,6 +51,11 @@ try:
 except Exception:
     _dlog = None
 
+try:
+    import messages_store  # 对话旁路落库（B1）；缺失或异常绝不影响转发主流程
+except Exception:
+    messages_store = None
+
 # 会话预览里的标记，用作「群名」与「群内发言」的边界
 MARK_RE = re.compile(
     r"(Stuck on Top|\d+\s+unread message\(s\)|\[You were mentioned\]|\[有人@我\])")
@@ -307,6 +312,17 @@ def main():
                     if tags:
                         body = f"【{'；'.join(tags)}】\n{body}"
                     send_mail(cfg, who, body, kind)
+                    if messages_store is not None:      # 旁路落库(B1)：逐条 + AI 回复
+                        try:
+                            for m in r["new_msgs"]:
+                                messages_store.tee(
+                                    who, kind, m.get("sender") or "unknown",
+                                    m.get("text") or "",
+                                    msg_type=m.get("kind", "text"))
+                            if r.get("reply"):
+                                messages_store.tee(who, kind, "assistant", r["reply"])
+                        except Exception:
+                            pass
                     continue
 
                 # 群：沿用"未读数上涨"判定(天然区分收到 vs 自己发)
@@ -343,6 +359,15 @@ def main():
                                     log(f"  媒体解析异常: {e}")
                             send_mail(cfg, who, head + "\n" + "\n".join(lines),
                                       kind, attachments)
+                            if messages_store is not None:  # 旁路落库(B1)：洪峰逐条
+                                try:
+                                    for m in msgs:
+                                        messages_store.tee(
+                                            who, kind, m.get("sender") or "unknown",
+                                            m.get("text") or "",
+                                            msg_type=m.get("kind", "text"))
+                                except Exception:
+                                    pass
                             continue
                         log("  洪峰补收失败，退化为单条转发")
                     # 单条路径:图片/语音打开群定位媒体消息，多模态/转文字解析
@@ -359,6 +384,12 @@ def main():
                         except Exception as e:
                             log(f"  媒体解析异常: {e}")
                     send_mail(cfg, who, text, kind, attachments)
+                    if messages_store is not None:      # 旁路落库(B1)：群单条
+                        try:
+                            messages_store.tee(who, kind, "group", text,
+                                               assets=attachments)
+                        except Exception:
+                            pass
             if rounds == baseline_rounds:
                 log("基线建立完成，开始转发群消息。")
             rounds += 1

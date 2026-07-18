@@ -34,6 +34,24 @@ from wechat_media_resolve import (_apps, capture_image, describe_image,
 DISPLAY = os.environ.get("DISPLAY", ":99")
 CHAT_MODEL = os.environ.get("OPENCLAW_CHAT_MODEL", "bailian/qwen3.5-plus")
 PEER = "灰灰"        # 对方(老婆)昵称
+
+# ---- LinChat 老公 channel（C2）----
+# 文本消息优先路由到 LinChat agent（共享记忆/上下文），失败降级到本地 _openclaw。
+# token 走 _linchat_secret（环境变量优先，其次 ~/.wechat-narrator/secrets.json，与 wechat 惯例一致）。
+def _linchat_secret(name, default=""):
+    v = os.environ.get(name)
+    if v:
+        return v
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".wechat-narrator", "secrets.json")) as f:
+            return json.load(f).get(name, default)
+    except (OSError, ValueError):
+        return default
+
+
+LINCHAT_HUSBAND_URL = _linchat_secret(
+    "LINCHAT_HUSBAND_URL", "http://127.0.0.1:8002/api/v1/internal/husband/reply/")
+LINCHAT_DEVICE_TOKEN = _linchat_secret("LINCHAT_DEVICE_TOKEN", "")
 # 会话区里的时间戳/日期分隔行(非消息)
 NOISE_RE = re.compile(r'^\d{1,2}:\d{2}$|^(Yesterday|昨天|星期|周[一二三四五六日])|^\d{4}年')
 
@@ -129,6 +147,27 @@ PERSONA = f"""# 角色
 - 只输出要发给{PEER}的那句话本身，不要引号、不要解释、不要写"（老公回复）"之类旁白。
 - 不确定的事实或重要决定（花钱、健康、行程）别凭空承诺，可以说"等我回家咱俩细说"。
 - 回复要针对【最新消息】，历史记录只用来理解上下文，不要逐条回应。"""
+
+
+def _linchat_husband(message, origin_peer, timeout=60):
+    """POST 文本到 LinChat 老公 channel 端点，聚合回复。
+
+    层1 回声令牌校验：响应必须回带 channel=="wechat" 且 origin_peer 一致、reply 非空，
+    任一不符即抛（防串台/防污染）。非 200 / 网络错误 / 校验不符一律抛，由调用方降级。
+    """
+    body = {"message": message, "channel": "wechat", "origin_peer": origin_peer}
+    req = urllib.request.Request(
+        LINCHAT_HUSBAND_URL, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Device-Token": LINCHAT_DEVICE_TOKEN},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        if r.getcode() != 200:
+            raise ValueError(f"husband HTTP {r.getcode()}")
+        d = json.loads(r.read())["data"]
+    reply = (d.get("reply") or "").strip()
+    if d.get("channel") != "wechat" or d.get("origin_peer") != origin_peer or not reply:
+        raise ValueError("echo-token mismatch/empty")
+    return reply
 
 
 def _openclaw(messages, model, max_tokens=300):
@@ -246,6 +285,11 @@ def generate_reply(history):
                             "image_url": {"url": "data:image/png;base64," + b64}})
         user_msg = {"role": "user", "content": content}
     else:
+        # 文本分支：优先走 LinChat 老公 channel（共享记忆/上下文）；任何异常降级本地 _openclaw。
+        try:
+            return _linchat_husband(latest["text"], PEER)
+        except Exception:
+            pass
         txt = (f"【历史聊天记录（仅供了解上下文，不必逐条回应）】\n{hist_block}\n\n"
                f"【{PEER}刚发来的消息（请回复这一条）】\n{latest['text']}\n\n"
                f"请以老公的身份回复{PEER}上面这条最新消息：")
