@@ -15,6 +15,7 @@ at-spi-bus-launcher 运行。
 import argparse
 import os
 import re
+import signal
 import subprocess
 import time
 
@@ -140,6 +141,8 @@ def main():
                     help="也朗读公众号/服务号（默认跳过）")
     args = ap.parse_args()
 
+    # 让内核自动回收 espeak-ng 子进程(fire-and-forget 朗读)，杜绝 <defunct> zombie 累积
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
     n = Narrator(voice=args.voice, rate=args.rate, wav_dir=args.wav_dir,
                  skip_official=not args.include_official)
     scope = "含公众号" if args.include_official else "仅真人/群"

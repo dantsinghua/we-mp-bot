@@ -1,5 +1,6 @@
 # --- secrets & runtime data: never commit ---
 scripts/wechat-narrator/wemprss-data/
+scripts/wechat-narrator/oa_fts.db*
 __pycache__/
 *.pyc
 logs/
@@ -16,3 +17,4 @@ wstunnel_linux_arm64
 config/
 memory/
 openclaw-workspace-state.json
+scripts/wechat-narrator/messages.db

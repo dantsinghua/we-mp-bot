@@ -25,6 +25,7 @@ LOG = os.path.join(LOG_DIR, "watchdog.log")
 STAMP_RESTART = os.path.join(LOG_DIR, ".wd_last_restart")
 STAMP_AUTH = os.path.join(LOG_DIR, ".wd_last_auth_alert")
 STAMP_UPSTREAM = os.path.join(LOG_DIR, ".wd_last_upstream_alert")
+STAMP_TASK = os.path.join(LOG_DIR, ".wd_last_task_alert")
 PATCH_SH = os.path.join(HOME, "clawd", "scripts", "wechat-narrator", "wemprss_patch.sh")
 
 INGEST_STALE_H = 6        # created_at 停滞阈值 → 本地卡死,重启
@@ -97,7 +98,7 @@ def alert(subject, body, severity="urgent"):
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = Header(f"{tag}[公众号] {subject}", "utf-8")
         msg["From"] = "wechat-narrator@test.local"
-        msg["To"] = "wechat-narrator@test.local"
+        msg["To"] = "wechat-group@test.local"  # 安琳 Outlook 读此邮箱
         msg["X-WN-Category"] = "oa"
         msg["X-WN-Severity"] = severity
         msg["X-WN-Source"] = "watchdog"
@@ -140,6 +141,11 @@ def restart_container(reason):
 
 
 def main():
+    # 暂停开关：存在 .wd_paused 时看门狗完全空转(不重启/不触发/不告警)。
+    # 用于风控冷却期人为停抓——删掉该文件即恢复看护。
+    if os.path.exists(os.path.join(LOG_DIR, ".wd_paused")):
+        log("PAUSED (.wd_paused 存在) → 本轮跳过所有检查")
+        return
     # container up?
     rc, out, _ = sh("docker ps --filter name=we-mp-rss --format '{{.Status}}'")
     if not out.startswith("Up"):
@@ -206,8 +212,10 @@ def main():
     if rc == 0 and out.isdigit() and int(out) > 0:
         log(f"unlocked {out} stuck FETCHING articles")
 
-    # 4. Invalid Session
-    rc, out, _ = sh("docker logs we-mp-rss --since 35m 2>&1 | grep -ac 'Invalid Session' || true")
+    # 4. 授权过期：旧版打 'Invalid Session'；新版(登录模块 v1.5.2+)过期时转而打
+    #    '微信公众平台登录'(启动扫码浏览器)。两个签名都算授权过期。
+    rc, out, _ = sh("docker logs we-mp-rss --since 35m 2>&1 | "
+                    "grep -acE 'Invalid Session|微信公众平台登录' || true")
     n = int(out) if out.isdigit() else 0
     if n > 0 and stamp_ok(STAMP_AUTH, AUTH_ALERT_GAP):
         touch(STAMP_AUTH)
@@ -225,6 +233,22 @@ def main():
             alert("wemprss-bridge 无心跳已重启", "journal 静默超过 26 小时")
     except ValueError:
         pass
+
+    # 6. 定时采集任务未启用 (status != 1) → 根本不会自动抓取(静默停真凶,区别于风控)
+    rc, out = container_py(
+        "import sqlite3\n"
+        "c = sqlite3.connect('file:/app/data/db.db?mode=ro', uri=True, timeout=5)\n"
+        f"r = c.execute(\"SELECT status FROM message_tasks WHERE id='{TASK_ID}'\").fetchone()\n"
+        "print(r[0] if r else 'MISSING')\n")
+    if rc == 0 and out and out not in ("1",):
+        log(f"crawl task not enabled: status={out!r}")
+        if stamp_ok(STAMP_TASK, AUTH_ALERT_GAP):
+            touch(STAMP_TASK)
+            alert("定时采集任务未启用，公众号不会自动抓取",
+                  f"we-mp-rss 定时采集任务 status={out}（需为 1=启用）。\n"
+                  "→ 系统不会自动爬取新文章（这与微信风控不同，是任务被关）。\n"
+                  "处理：we-mp-rss「定时任务」里启用该任务，或对 Claude 说「启用定时采集」。",
+                  severity="urgent")
 
     log("cycle done")
 

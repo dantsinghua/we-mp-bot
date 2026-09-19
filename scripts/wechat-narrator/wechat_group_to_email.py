@@ -205,7 +205,17 @@ def main():
            "from_addr": args.from_addr, "to_addr": args.to_addr}
 
     group_kw = [k.strip() for k in args.group.split(",") if k.strip()]
-    dm_kw = [k.strip() for k in args.dm.split(",") if k.strip()]
+    # DM 接收人优先读灵活配置 narrator_config.json 的 dm_peer（改人不用重启服务：改配置 + safe-pkill group2email 即可），缺省回落 --dm
+    _cfg_dm_peer = None
+    try:
+        import json
+        with open(os.path.join(os.path.expanduser("~"), ".wechat-narrator", "narrator_config.json")) as _f:
+            _cfg_dm_peer = (json.load(_f) or {}).get("dm_peer") or None
+    except (OSError, ValueError):
+        _cfg_dm_peer = None
+    dm_kw = [_cfg_dm_peer] if _cfg_dm_peer else [k.strip() for k in args.dm.split(",") if k.strip()]
+    if _cfg_dm_peer:
+        log(f"DM 接收人来自配置: {_cfg_dm_peer}")
     msg_state, unread_state = {}, {}
     reply_state = {}         # 私聊每个对象最近一次自动回复文本，避免把自己的回复当新消息
     cursor_state = {}        # 每个会话的游标锚块(最后K条消息序列)，洪峰补转/漏收补转用

@@ -33,7 +33,17 @@ from wechat_media_resolve import (_apps, capture_image, describe_image,
 
 DISPLAY = os.environ.get("DISPLAY", ":99")
 CHAT_MODEL = os.environ.get("OPENCLAW_CHAT_MODEL", "bailian/qwen3.5-plus")
-PEER = "灰灰"        # 对方(老婆)昵称
+def _load_narrator_config():
+    import json
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".wechat-narrator", "narrator_config.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+# 对方(老婆)昵称/备注 —— 灵活配置：改人只需改 narrator_config.json 的 dm_peer + safe-pkill group2email，不用重启服务
+PEER = _load_narrator_config().get("dm_peer") or "灰灰"
 
 # ---- LinChat 老公 channel（C2）----
 # 文本消息优先路由到 LinChat agent（共享记忆/上下文），失败降级到本地 _openclaw。
